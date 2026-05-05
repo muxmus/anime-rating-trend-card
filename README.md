@@ -1,8 +1,10 @@
-## anime-rating-trend-card
+### anime-rating-trend-card
+
+---
 
 基于[netaba.re](https://netaba.re)，采用其api构建
 
-可通过bangumi_id返回对应的动画评分趋势卡片
+可通过`bangumi_id`返回对应动画的评分趋势卡片
 
 ---
 
