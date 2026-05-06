@@ -14,4 +14,22 @@
 
 ![](https://img.muxmus.com/ani-card/493016)
 
+或jpg格式
+
+[https://img.muxmus.com/ani-card/493016?type=jpg](https://img.muxmus.com/ani-card/493016?type=jpg)
+
+![](https://img.muxmus.com/ani-card/493016?type=jpg)
+
+---
+确保依赖：
+`pip install requests svgwrite`
+svg转jpg需要额外安装的库：
+```
+sudo apt install libcairo2
+pip install cairosvg Pillow
+sudo apt install fonts-dejavu-core
+sudo apt install fonts-noto-cjk
+sudo apt install fonts-wqy-microhei
+```
+
 > *代码由deepseek生成*
