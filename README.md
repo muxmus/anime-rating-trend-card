@@ -23,6 +23,7 @@
 ---
 确保依赖：
 `pip install requests svgwrite`
+
 svg转jpg需要额外安装的库：
 ```
 sudo apt install libcairo2
