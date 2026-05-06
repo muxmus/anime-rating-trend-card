@@ -201,7 +201,8 @@ def generate_svg(cooked: dict) -> str:
     if is_finished:
         x_end = x_pos(latest_record)
         dwg.add(dwg.line((x_end, HEIGHT - PAD_B - 4), (x_end, HEIGHT - PAD_B + 4), class_="axis"))
-        dwg.add(dwg.text(latest_record.strftime("%m-%d"), insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
+        #dwg.add(dwg.text(latest_record.strftime("%m-%d"), insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
+        dwg.add(dwg.text("now", insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
 
     # 剧集标题
     for ep in eps_sorted:
