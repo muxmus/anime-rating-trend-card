@@ -1,9 +1,11 @@
 import json
 import math
+import io
 import requests
 import svgwrite
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 # 北京时区 (UTC+8)
 BJT = timezone(timedelta(hours=8))
@@ -162,19 +164,20 @@ def generate_svg(cooked: dict) -> str:
         return HEIGHT - PAD_B - ratio * plot_h
 
     dwg = svgwrite.Drawing(size=(WIDTH, HEIGHT))
+    # ★ 关键修复：字体栈同时包含中英文字体，用 Noto Sans CJK / 文泉驿微米黑 作为最佳选择
     dwg.embed_stylesheet("""
         .grid { stroke: #e8e8e8; stroke-width: 1; }
         .axis { stroke: #555; stroke-width: 2; }
         .curve { fill: none; stroke: #4A90D9; stroke-width: 3; }
-        .title { font-family: "Helvetica Neue", sans-serif; font-size: 30px; font-weight: bold; fill: #333; }
-        .score-text { font-family: "Helvetica Neue", sans-serif; font-size: 38px; font-weight: bold; fill: #4A90D9; }
-        .user-text { font-family: "Helvetica Neue", sans-serif; font-size: 18px; font-weight: 600; fill: #666; }
+        .title { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 30px; font-weight: bold; fill: #333; }
+        .score-text { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 38px; font-weight: bold; fill: #4A90D9; }
+        .user-text { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 18px; font-weight: 600; fill: #666; }
         .ep-label { 
-            font-family: "Helvetica Neue", sans-serif; font-size: 14px; font-weight: bold; fill: #555; opacity: 0.5; 
+            font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #555; opacity: 0.5; 
             text-anchor: start;
         }
-        .date-label { font-family: "Helvetica Neue", sans-serif; font-size: 13px; font-weight: bold; fill: #999; }
-        .y-label { font-family: "Helvetica Neue", sans-serif; font-size: 14px; font-weight: bold; fill: #999; }
+        .date-label { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 13px; font-weight: bold; fill: #999; }
+        .y-label { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #999; }
     """)
     dwg.add(dwg.rect(insert=(0, 0), size=(WIDTH, HEIGHT), fill="#fafafa"))
 
@@ -200,7 +203,7 @@ def generate_svg(cooked: dict) -> str:
         dwg.add(dwg.line((x_end, HEIGHT - PAD_B - 4), (x_end, HEIGHT - PAD_B + 4), class_="axis"))
         dwg.add(dwg.text(latest_record.strftime("%m-%d"), insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
 
-    # 剧集标题 (加粗加大，位置保持右上偏移，不与刻度重叠)
+    # 剧集标题
     for ep in eps_sorted:
         if ep["airdate"] < first_date or ep["airdate"] > max_date:
             continue
@@ -233,29 +236,58 @@ def generate_svg(cooked: dict) -> str:
 
     return dwg.tostring()
 
-def generate_card(anime_id: int) -> str:
+def svg_to_jpg(svg_str: str, quality: int = 90) -> bytes:
+    """将 SVG 字符串转换为 JPEG 字节流（惰性导入依赖）。"""
     try:
-        raw = get_anime_data(anime_id)
-        cooked = parse_and_filter(raw)
-        return generate_svg(cooked)
-    except Exception as e:
-        dwg = svgwrite.Drawing(size=(600, 300))
-        dwg.add(dwg.text(f"Error: {e}", insert=(20, 40), fill="red"))
-        return dwg.tostring()
+        import cairosvg
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError("请安装 cairosvg 和 Pillow：pip install cairosvg Pillow") from e
+
+    png_bytes = cairosvg.svg2png(bytestring=svg_str.encode('utf-8'))
+    img = Image.open(io.BytesIO(png_bytes)).convert('RGB')
+    jpg_buffer = io.BytesIO()
+    img.save(jpg_buffer, format='JPEG', quality=quality)
+    return jpg_buffer.getvalue()
+
+def generate_card(anime_id: int, fmt: str = "svg") -> tuple[bytes, str]:
+    raw = get_anime_data(anime_id)
+    cooked = parse_and_filter(raw)
+    svg_str = generate_svg(cooked)
+
+    if fmt == "jpg":
+        try:
+            jpg_bytes = svg_to_jpg(svg_str)
+            return jpg_bytes, "image/jpeg"
+        except Exception:
+            pass
+    return svg_str.encode("utf-8"), "image/svg+xml"
 
 # -------------------- HTTP 服务器 --------------------
 class AnimeCardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        anime_id_str = self.path.strip("/")
+        parsed = urlparse(self.path)
+        anime_id_str = parsed.path.strip("/")
+        params = parse_qs(parsed.query)
+
         if not anime_id_str.isdigit():
             self.send_error(400, "Invalid anime ID")
             return
+
         anime_id = int(anime_id_str)
-        svg_content = generate_card(anime_id)
+        fmt = params.get("type", ["svg"])[0].lower()
+
+        try:
+            content, mime = generate_card(anime_id, fmt)
+        except Exception as e:
+            self.send_error(500, str(e))
+            return
+
         self.send_response(200)
-        self.send_header("Content-Type", "image/svg+xml")
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(content)))
         self.end_headers()
-        self.wfile.write(svg_content.encode())
+        self.wfile.write(content)
 
     def log_message(self, format, *args):
         pass
@@ -263,6 +295,7 @@ class AnimeCardHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", 5700), AnimeCardHandler)
     print("动漫评分卡片服务已启动: http://0.0.0.0:5700/{anime_id}")
+    print("默认 SVG，添加 ?type=jpg 获取 JPEG")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
