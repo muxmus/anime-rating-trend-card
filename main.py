@@ -23,11 +23,16 @@ def get_anime_data(anime_id: int) -> dict:
 
 def parse_and_filter(data: dict) -> dict:
     subject = data.get("subject", {})
+    
+    # 1. 检查 air_date 是否为空
+    if not subject.get("air_date"):
+        raise NotYetAired("作品尚未公布播出日期或无有效开播信息")
+    
     name_cn = subject.get("name_cn") or subject.get("name") or "未知作品"
     air_date_utc = datetime.fromisoformat(subject["air_date"].replace("Z", "+00:00"))
     air_date_bjt = air_date_utc.astimezone(BJT)
 
-    # 1. 检查是否未开播：获取所有 history 中最晚的 recordedAt
+    # 检查是否未开播：获取所有 history 中最晚的 recordedAt
     history = data.get("history", [])
     max_recorded_bjt = None
     for item in history:
@@ -84,7 +89,8 @@ def parse_and_filter(data: dict) -> dict:
     }
 
 # -------------------- 曲线平滑工具 --------------------
-def catmull_rom_to_bezier(points, tension=0.2):
+def catmull_rom_to_bezier(points, tension=0.1):
+    """Catmull-Rom 转 Bezier 曲线，tension 降低以减少回绕"""
     if len(points) < 2:
         return ""
     size = len(points)
@@ -103,6 +109,15 @@ def catmull_rom_to_bezier(points, tension=0.2):
         d += f"C {cp1x:.1f},{cp1y:.1f} {cp2x:.1f},{cp2y:.1f} {p2[0]:.1f},{p2[1]:.1f} "
     return d.strip()
 
+def generate_polyline(points):
+    """产生折线路径，用于点数过少时"""
+    if not points:
+        return ""
+    d = f"M {points[0][0]:.1f},{points[0][1]:.1f} "
+    for p in points[1:]:
+        d += f"L {p[0]:.1f},{p[1]:.1f} "
+    return d.strip()
+
 def moving_average_smooth(points, window=3):
     if len(points) < window:
         return points
@@ -116,6 +131,7 @@ def moving_average_smooth(points, window=3):
     return smoothed
 
 def downsample_points(points, min_pixel_dist=10.0):
+    """降采样，min_pixel_dist 可动态调整"""
     if len(points) < 3:
         return points
     kept = [points[0]]
@@ -149,13 +165,11 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
     normal_w = plot_w * (1 - COMPRESS_RATIO)
     compress_w = plot_w * COMPRESS_RATIO
 
-    # 检查评分数据是否存在
     if not cooked["scores"]:
         raise ValueError("没有可用的评分数据")
 
     # 根据是否包含剧集信息选择不同的横轴计算方式
     if not show_eps_and_title:
-        # 所有评分都在最后一集之后：仅使用评分时间范围
         score_dates = [s["date"] for s in cooked["scores"]]
         first_date = min(score_dates)
         normal_end_date = max(score_dates)
@@ -165,7 +179,6 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
         eps_sorted = []
     else:
         eps_sorted = sorted(cooked["eps"], key=lambda e: e["airdate"])
-        # 如果没有有效剧集，自动切换为无剧集模式
         if not eps_sorted:
             show_eps_and_title = False
             score_dates = [s["date"] for s in cooked["scores"]]
@@ -239,7 +252,7 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
     dwg.embed_stylesheet("""
         .grid { stroke: #e8e8e8; stroke-width: 1; }
         .axis { stroke: #555; stroke-width: 2; }
-        .curve { fill: none; stroke: #4A90D9; stroke-width: 3; }
+        .curve { fill: none; stroke: #4A90D9; stroke-width: 4; }
         .title { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 30px; font-weight: bold; fill: #333; }
         .score-text { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 38px; font-weight: bold; fill: #4A90D9; }
         .user-text { font-family: 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'DejaVu Sans', Arial, sans-serif; font-size: 18px; font-weight: 600; fill: #666; }
@@ -310,7 +323,6 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
             dwg.add(dwg.line((x_end, HEIGHT - PAD_B - 4), (x_end, HEIGHT - PAD_B + 4), class_="axis"))
             dwg.add(dwg.text("now", insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
     else:
-        # 仅显示最早评分记录和当前时间（now）
         x_start = x_pos(first_date)
         dwg.add(dwg.line((x_start, HEIGHT - PAD_B - 4), (x_start, HEIGHT - PAD_B + 4), class_="axis"))
         start_date_str = f"{first_date.year % 100}.{first_date.month}.{first_date.day}"
@@ -335,12 +347,43 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
                 class_="ep-label"
             ))
 
-    # 平滑曲线
-    raw_points = [(x_pos(s["date"]), y_pos(s["score"])) for s in cooked["scores"]]
-    sparse = downsample_points(raw_points, min_pixel_dist=10.0)
+    # ---------- 曲线生成（修复绕圈 + 阶梯降采样）----------
+    # 1. 按日期排序并去重（保留同一天的第一个记录）
+    sorted_scores = sorted(cooked["scores"], key=lambda x: x["date"])
+    deduped = []
+    for s in sorted_scores:
+        if not deduped or s["date"] != deduped[-1]["date"]:
+            deduped.append(s)
+        else:
+            # 同一天取最新的评分（可根据需要改为平均）
+            deduped[-1] = s
+
+    # 2. 计算原始坐标点
+    raw_points = [(x_pos(s["date"]), y_pos(s["score"])) for s in deduped]
+
+    # 3. 阶梯降采样：根据数据量动态调整 min_pixel_dist
+    base_dist = 10.0
+    if len(raw_points) > 5000:
+        min_pixel_dist = base_dist * 4  # 40
+    elif len(raw_points) > 2000:
+        min_pixel_dist = base_dist * 2  # 20
+    elif len(raw_points) > 500:
+        min_pixel_dist = base_dist * 1.5  # 15
+    else:
+        min_pixel_dist = base_dist
+
+    sparse = downsample_points(raw_points, min_pixel_dist=min_pixel_dist)
     smoothed = moving_average_smooth(sparse, window=3)
-    if len(smoothed) >= 2:
-        path_d = catmull_rom_to_bezier(smoothed, tension=0.2)
+
+    # 4. 根据点数选择曲线类型
+    if len(smoothed) >= 3:
+        path_d = catmull_rom_to_bezier(smoothed, tension=0.1)
+    elif len(smoothed) == 2:
+        path_d = generate_polyline(smoothed)
+    else:
+        path_d = ""
+
+    if path_d:
         dwg.add(dwg.path(d=path_d, class_="curve"))
 
     # 动画总标题（始终显示）
@@ -365,7 +408,6 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
     return dwg.tostring()
 
 def svg_to_jpg(svg_str: str, quality: int = 90) -> bytes:
-    """将 SVG 字符串转换为 JPEG 字节流"""
     try:
         import cairosvg
         from PIL import Image
@@ -382,7 +424,6 @@ def generate_card(anime_id: int, fmt: str = "svg") -> tuple[bytes, str]:
     raw = get_anime_data(anime_id)
     cooked = parse_and_filter(raw)
 
-    # 检查最早评分是否晚于最后一集（如果剧集存在）
     scores_sorted = sorted(cooked["scores"], key=lambda x: x["date"])
     eps_sorted = sorted(cooked["eps"], key=lambda e: e["airdate"])
     show_eps_and_title = True
