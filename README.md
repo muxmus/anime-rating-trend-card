@@ -8,7 +8,7 @@
 
 ---
 
-如《异国日记》493016
+如《异国日记》493016 [https://bgm.tv/subject/493016](https://bgm.tv/subject/493016)
 
 [https://img.muxmus.com/ani-card/493016](https://img.muxmus.com/ani-card/493016)
 
