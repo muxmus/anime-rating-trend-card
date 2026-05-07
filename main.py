@@ -34,14 +34,20 @@ def parse_and_filter(data: dict) -> dict:
 
     eps = []
     for item in data["subject"]["eps"]:
+        # 12. 只保留 type == 0 且 airdate 不为空的集
+        if item.get("type") != 0:
+            continue
+        if not item.get("airdate"):
+            continue
         dt_utc = datetime.fromisoformat(item["airdate"].replace("Z", "+00:00"))
         dt_bjt = dt_utc.astimezone(BJT)
         ep_name_cn = item.get("name_cn", "")
         ep_name = item.get("name", "")
+        ep_display_name = ep_name_cn or ep_name  # 可能为空字符串
         eps.append({
             "sort": item["sort"],
             "name": ep_name,
-            "name_cn": ep_name_cn or ep_name,
+            "name_cn": ep_display_name,  # 14. 可能为""
             "airdate": dt_bjt
         })
 
@@ -96,6 +102,22 @@ def downsample_points(points, min_pixel_dist=10.0):
             kept.append(p)
     kept.append(points[-1])
     return kept
+
+# -------------------- 坐标轴刻度辅助 --------------------
+def nice_step(rough: float) -> float:
+    """返回一个 >=0.1 且为 0.1 整数倍的美观步长"""
+    if rough <= 0.1:
+        return 0.1
+    # 计算数量级
+    factor = 10 ** math.floor(math.log10(rough))
+    normalized = rough / factor
+    # 从标准步长中选择第一个 >= normalized 的值
+    for candidate in [1, 2, 5, 10]:
+        if candidate >= normalized:
+            step = candidate * factor
+            # 确保步长是 0.1 的整数倍（已经满足，但要保证最小为 0.1）
+            return max(0.1, step)
+    return 10 * factor
 
 # -------------------- SVG 生成 --------------------
 def generate_svg(cooked: dict) -> str:
@@ -154,9 +176,16 @@ def generate_svg(cooked: dict) -> str:
     scores = [s["score"] for s in cooked["scores"]]
     min_s, max_s = min(scores), max(scores)
     score_range = max_s - min_s
-    y_buffer = score_range * 0.1 if score_range > 0 else 0.5
-    y_min = max(0, min_s - y_buffer)
-    y_max = min_s + score_range + y_buffer
+
+    # 8. Y轴刻度步长必须 >=0.1，且所有刻度线为 0.1 的整数倍
+    step = nice_step(score_range / 4.0) if score_range > 0 else 0.1
+    # 上下各留一个步长的边距，且 y_min >= 0
+    y_min = max(0.0, step * (math.floor(min_s / step) - 1))
+    y_max = step * (math.ceil(max_s / step) + 1)
+    # 确保至少有两根线
+    if y_max <= y_min + step:
+        y_max = y_min + step
+
     plot_h = HEIGHT - PAD_T - PAD_B
 
     def y_pos(s):
@@ -164,7 +193,6 @@ def generate_svg(cooked: dict) -> str:
         return HEIGHT - PAD_B - ratio * plot_h
 
     dwg = svgwrite.Drawing(size=(WIDTH, HEIGHT))
-    # ★ 关键修复：字体栈同时包含中英文字体，用 Noto Sans CJK / 文泉驿微米黑 作为最佳选择
     dwg.embed_stylesheet("""
         .grid { stroke: #e8e8e8; stroke-width: 1; }
         .axis { stroke: #555; stroke-width: 2; }
@@ -181,39 +209,73 @@ def generate_svg(cooked: dict) -> str:
     """)
     dwg.add(dwg.rect(insert=(0, 0), size=(WIDTH, HEIGHT), fill="#fafafa"))
 
-    # 网格线
-    for i in range(6):
-        y_val = y_min + (y_max - y_min) * i / 5
+    # 网格线与Y轴标签
+    y_val = y_min
+    while y_val <= y_max + 1e-9:
         y = y_pos(y_val)
         dwg.add(dwg.line((PAD_L, y), (WIDTH - PAD_R, y), class_="grid"))
         dwg.add(dwg.text(f"{y_val:.1f}", insert=(PAD_L - 10, y + 5), class_="y-label", text_anchor="end"))
+        y_val += step
 
     dwg.add(dwg.line((PAD_L, HEIGHT - PAD_B), (WIDTH - PAD_R, HEIGHT - PAD_B), class_="axis"))
 
-    # 横轴日期标注
+    # 10. 合并同一天播出的集数
+    merged_eps = []
+    i = 0
+    while i < len(eps_sorted):
+        ep = eps_sorted[i]
+        airdate = ep["airdate"]
+        same_day = [ep]
+        j = i + 1
+        while j < len(eps_sorted) and eps_sorted[j]["airdate"].date() == airdate.date():
+            same_day.append(eps_sorted[j])
+            j += 1
+        first_ep = same_day[0]
+        last_ep = same_day[-1]
+        sort_min = first_ep["sort"]
+        sort_max = last_ep["sort"]
+        name_cn = first_ep["name_cn"]  # 可能为空字符串
+        if len(same_day) == 1:
+            if name_cn:
+                label = f"EP{sort_min} {name_cn}"
+            else:
+                label = f"EP{sort_min}"
+        else:
+            if name_cn:
+                label = f"EP{sort_min}-{sort_max} {name_cn} 等"
+            else:
+                label = f"EP{sort_min}-{sort_max}"
+        merged_eps.append({"airdate": airdate, "label": label})
+        i = j
+
+    # 建立一个集合，快速判断某日期是否有集播出
+    ep_dates = {ep["airdate"].date() for ep in merged_eps}
+
+    # 横轴日期标注（9. 除首尾外在有集播出时显示日期文字，13. 日期格式为 M.D 无前导零）
     day = first_date
     while day <= normal_end_date:
         x = x_pos(day)
         dwg.add(dwg.line((x, HEIGHT - PAD_B - 4), (x, HEIGHT - PAD_B + 4), class_="axis"))
-        dwg.add(dwg.text(day.strftime("%m-%d"), insert=(x, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
+        # 首尾日期始终显示，中间只在集播出日显示
+        if day.date() == first_date.date() or day.date() == normal_end_date.date() or day.date() in ep_dates:
+            date_str = f"{day.month}.{day.day}"
+            dwg.add(dwg.text(date_str, insert=(x, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
         day += timedelta(days=7)
 
     if is_finished:
         x_end = x_pos(latest_record)
         dwg.add(dwg.line((x_end, HEIGHT - PAD_B - 4), (x_end, HEIGHT - PAD_B + 4), class_="axis"))
-        #dwg.add(dwg.text(latest_record.strftime("%m-%d"), insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
         dwg.add(dwg.text("now", insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
 
-    # 剧集标题
-    for ep in eps_sorted:
+    # 剧集标题（合并后）
+    for ep in merged_eps:
         if ep["airdate"] < first_date or ep["airdate"] > max_date:
             continue
         x = x_pos(ep["airdate"])
-        label = f"EP{ep['sort']} {ep['name_cn']}"
         anchor_x = x + 16
         anchor_y = HEIGHT - PAD_B - 12
         dwg.add(dwg.text(
-            label,
+            ep["label"],
             insert=(anchor_x, anchor_y),
             transform=f"rotate(-90, {anchor_x}, {anchor_y})",
             class_="ep-label"
@@ -227,13 +289,24 @@ def generate_svg(cooked: dict) -> str:
         path_d = catmull_rom_to_bezier(smoothed, tension=0.2)
         dwg.add(dwg.path(d=path_d, class_="curve"))
 
-    # 标题与评分
+    # 标题与评分（11. 分数位置根据评价人数长度动态左移）
     dwg.add(dwg.text(cooked["name_cn"], insert=(PAD_L, 44), class_="title"))
     latest_score = round(cooked["scores"][-1]["score"], 1)
+    total_users = cooked["total_users"]
+    user_text = f"{total_users}人评价"
+    # 估算用户文本像素宽度：数字部分半角（约9px/char），“人评价”三个全角（约18px/char）
+    digit_chars = len(str(total_users))
+    user_est_width = digit_chars * 9 + 3 * 18
+    # 评分数字右对齐位置：用户文本左边再留20px间距
+    score_x = WIDTH - PAD_R - user_est_width - 20
     dwg.add(dwg.text(f"{latest_score:.1f}",
-                     insert=(WIDTH - PAD_R - 110, 44), class_="score-text", text_anchor="end"))
-    dwg.add(dwg.text(f"{cooked['total_users']}人评价",
-                     insert=(WIDTH - PAD_R, 44), class_="user-text", text_anchor="end"))
+                     insert=(score_x, 44),
+                     class_="score-text",
+                     text_anchor="end"))
+    dwg.add(dwg.text(user_text,
+                     insert=(WIDTH - PAD_R, 44),
+                     class_="user-text",
+                     text_anchor="end"))
 
     return dwg.tostring()
 
