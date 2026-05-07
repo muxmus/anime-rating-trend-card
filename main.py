@@ -10,6 +10,10 @@ from urllib.parse import urlparse, parse_qs
 # 北京时区 (UTC+8)
 BJT = timezone(timedelta(hours=8))
 
+class NotYetAired(Exception):
+    """动画尚未开播异常"""
+    pass
+
 # -------------------- 数据获取与处理 --------------------
 def get_anime_data(anime_id: int) -> dict:
     url = f"https://api.netaba.re/subject/{anime_id}"
@@ -18,11 +22,27 @@ def get_anime_data(anime_id: int) -> dict:
     return resp.json()
 
 def parse_and_filter(data: dict) -> dict:
-    name_cn = data["subject"]["name_cn"] or data["subject"]["name"]
-    air_date_utc = datetime.fromisoformat(data["subject"]["air_date"].replace("Z", "+00:00"))
+    subject = data["subject"]
+    name_cn = subject["name_cn"] or subject["name"]
+    air_date_utc = datetime.fromisoformat(subject["air_date"].replace("Z", "+00:00"))
     air_date_bjt = air_date_utc.astimezone(BJT)
 
+    # 1. 检查是否未开播：获取所有 history 中最晚的 recordedAt
     history = data["history"]
+    max_recorded_bjt = None
+    for item in history:
+        if "recordedAt" not in item:
+            continue
+        dt_utc = datetime.fromisoformat(item["recordedAt"].replace("Z", "+00:00"))
+        dt_bjt = dt_utc.astimezone(BJT)
+        if max_recorded_bjt is None or dt_bjt > max_recorded_bjt:
+            max_recorded_bjt = dt_bjt
+
+    # 若没有任何 history 记录，或开播日期晚于最新的记录时间，视为未开播
+    if max_recorded_bjt is None or air_date_bjt > max_recorded_bjt:
+        raise NotYetAired("动画尚未开播，无有效评分记录")
+
+    # 构建评分序列（仅保留开播之后的记录）
     scores = []
     for item in history:
         if "score" not in item:
@@ -32,9 +52,9 @@ def parse_and_filter(data: dict) -> dict:
         if dt_bjt.date() >= air_date_bjt.date():
             scores.append({"date": dt_bjt, "score": item["score"]})
 
+    # 剧集信息
     eps = []
-    for item in data["subject"]["eps"]:
-        # 12. 只保留 type == 0 且 airdate 不为空的集
+    for item in subject["eps"]:
         if item.get("type") != 0:
             continue
         if not item.get("airdate"):
@@ -43,15 +63,15 @@ def parse_and_filter(data: dict) -> dict:
         dt_bjt = dt_utc.astimezone(BJT)
         ep_name_cn = item.get("name_cn", "")
         ep_name = item.get("name", "")
-        ep_display_name = ep_name_cn or ep_name  # 可能为空字符串
+        ep_display_name = ep_name_cn or ep_name
         eps.append({
             "sort": item["sort"],
             "name": ep_name,
-            "name_cn": ep_display_name,  # 14. 可能为""
+            "name_cn": ep_display_name,
             "airdate": dt_bjt
         })
 
-    total_users = data["subject"]["rating"]["total"]
+    total_users = subject["rating"]["total"]
     return {
         "name_cn": name_cn,
         "air_date": air_date_bjt,
@@ -108,19 +128,16 @@ def nice_step(rough: float) -> float:
     """返回一个 >=0.1 且为 0.1 整数倍的美观步长"""
     if rough <= 0.1:
         return 0.1
-    # 计算数量级
     factor = 10 ** math.floor(math.log10(rough))
     normalized = rough / factor
-    # 从标准步长中选择第一个 >= normalized 的值
     for candidate in [1, 2, 5, 10]:
         if candidate >= normalized:
             step = candidate * factor
-            # 确保步长是 0.1 的整数倍（已经满足，但要保证最小为 0.1）
             return max(0.1, step)
     return 10 * factor
 
 # -------------------- SVG 生成 --------------------
-def generate_svg(cooked: dict) -> str:
+def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
     WIDTH, HEIGHT = 1200, 630
     PAD_L, PAD_R, PAD_T, PAD_B = 100, 50, 50, 80
     COMPRESS_RATIO = 0.12
@@ -129,31 +146,47 @@ def generate_svg(cooked: dict) -> str:
     normal_w = plot_w * (1 - COMPRESS_RATIO)
     compress_w = plot_w * COMPRESS_RATIO
 
-    eps_sorted = sorted(cooked["eps"], key=lambda e: e["airdate"])
-    if not eps_sorted or not cooked["scores"]:
-        raise ValueError("数据不足")
-
-    latest_record = cooked["scores"][-1]["date"]
-    last_ep_airdate = eps_sorted[-1]["airdate"]
-    is_finished = last_ep_airdate <= latest_record
-
-    if is_finished:
-        max_date = latest_record
-        normal_end_date = last_ep_airdate
+    # 根据是否包含剧集信息选择不同的横轴计算方式
+    if not show_eps_and_title:
+        # 所有评分都在最后一集之后：仅使用评分时间范围
+        score_dates = [s["date"] for s in cooked["scores"]]
+        first_date = min(score_dates)
+        normal_end_date = max(score_dates)
+        is_finished = False   # 不加 "now" 标签，直接显示最后日期
+        # 不使用压缩区域，整个横轴线性映射
+        normal_w = plot_w
+        compress_w = 0
+        eps_sorted = []       # 无剧集信息
     else:
-        next_ep = next((ep for ep in eps_sorted if ep["airdate"] > latest_record), None)
-        if next_ep is None:
-            is_finished = True
+        eps_sorted = sorted(cooked["eps"], key=lambda e: e["airdate"])
+        if not eps_sorted or not cooked["scores"]:
+            raise ValueError("数据不足")
+
+        latest_record = cooked["scores"][-1]["date"]
+        last_ep_airdate = eps_sorted[-1]["airdate"]
+        is_finished = last_ep_airdate <= latest_record
+
+        if is_finished:
             max_date = latest_record
             normal_end_date = last_ep_airdate
         else:
-            max_date = next_ep["airdate"]
-            normal_end_date = next_ep["airdate"]
+            next_ep = next((ep for ep in eps_sorted if ep["airdate"] > latest_record), None)
+            if next_ep is None:
+                is_finished = True
+                max_date = latest_record
+                normal_end_date = last_ep_airdate
+            else:
+                max_date = next_ep["airdate"]
+                normal_end_date = next_ep["airdate"]
 
-    first_date = cooked["air_date"]
+        first_date = cooked["air_date"]
+        # 正常区域宽度已算，保持不变
+        normal_w = plot_w * (1 - COMPRESS_RATIO)
+        compress_w = plot_w * COMPRESS_RATIO
+
     span_normal = max(1, (normal_end_date - first_date).days)
 
-    if is_finished:
+    if is_finished and show_eps_and_title:
         compress_start = last_ep_airdate
         compress_end = latest_record
         span_compress = max(1, (compress_end - compress_start).days)
@@ -166,7 +199,7 @@ def generate_svg(cooked: dict) -> str:
         if d <= normal_end_date:
             ratio = max(0, (d - first_date).days / span_normal)
             return PAD_L + ratio * normal_w
-        elif is_finished:
+        elif is_finished and show_eps_and_title:
             days_past = max(0, (d - compress_start).days)
             ratio = math.sqrt(days_past / span_compress)
             return PAD_L + normal_w + ratio * compress_w
@@ -177,12 +210,9 @@ def generate_svg(cooked: dict) -> str:
     min_s, max_s = min(scores), max(scores)
     score_range = max_s - min_s
 
-    # 8. Y轴刻度步长必须 >=0.1，且所有刻度线为 0.1 的整数倍
     step = nice_step(score_range / 4.0) if score_range > 0 else 0.1
-    # 上下各留一个步长的边距，且 y_min >= 0
     y_min = max(0.0, step * (math.floor(min_s / step) - 1))
     y_max = step * (math.ceil(max_s / step) + 1)
-    # 确保至少有两根线
     if y_max <= y_min + step:
         y_max = y_min + step
 
@@ -219,67 +249,81 @@ def generate_svg(cooked: dict) -> str:
 
     dwg.add(dwg.line((PAD_L, HEIGHT - PAD_B), (WIDTH - PAD_R, HEIGHT - PAD_B), class_="axis"))
 
-    # 10. 合并同一天播出的集数
-    merged_eps = []
-    i = 0
-    while i < len(eps_sorted):
-        ep = eps_sorted[i]
-        airdate = ep["airdate"]
-        same_day = [ep]
-        j = i + 1
-        while j < len(eps_sorted) and eps_sorted[j]["airdate"].date() == airdate.date():
-            same_day.append(eps_sorted[j])
-            j += 1
-        first_ep = same_day[0]
-        last_ep = same_day[-1]
-        sort_min = first_ep["sort"]
-        sort_max = last_ep["sort"]
-        name_cn = first_ep["name_cn"]  # 可能为空字符串
-        if len(same_day) == 1:
-            if name_cn:
-                label = f"EP{sort_min} {name_cn}"
+    # 剧集信息（仅当显示时）
+    if show_eps_and_title:
+        # 合并同一天播出的集数
+        merged_eps = []
+        i = 0
+        while i < len(eps_sorted):
+            ep = eps_sorted[i]
+            airdate = ep["airdate"]
+            same_day = [ep]
+            j = i + 1
+            while j < len(eps_sorted) and eps_sorted[j]["airdate"].date() == airdate.date():
+                same_day.append(eps_sorted[j])
+                j += 1
+            first_ep = same_day[0]
+            last_ep = same_day[-1]
+            sort_min = first_ep["sort"]
+            sort_max = last_ep["sort"]
+            name_cn = first_ep["name_cn"]
+            if len(same_day) == 1:
+                label = f"EP{sort_min} {name_cn}" if name_cn else f"EP{sort_min}"
             else:
-                label = f"EP{sort_min}"
-        else:
-            if name_cn:
-                label = f"EP{sort_min}-{sort_max} {name_cn} 等"
-            else:
-                label = f"EP{sort_min}-{sort_max}"
-        merged_eps.append({"airdate": airdate, "label": label})
-        i = j
+                label = f"EP{sort_min}-{sort_max} {name_cn} 等" if name_cn else f"EP{sort_min}-{sort_max}"
+            merged_eps.append({"airdate": airdate, "label": label})
+            i = j
 
-    # 建立一个集合，快速判断某日期是否有集播出
-    ep_dates = {ep["airdate"].date() for ep in merged_eps}
+        ep_dates = {ep["airdate"].date() for ep in merged_eps}
+    else:
+        merged_eps = []
+        ep_dates = set()
 
-    # 横轴日期标注（9. 除首尾外在有集播出时显示日期文字，13. 日期格式为 M.D 无前导零）
-    day = first_date
-    while day <= normal_end_date:
-        x = x_pos(day)
-        dwg.add(dwg.line((x, HEIGHT - PAD_B - 4), (x, HEIGHT - PAD_B + 4), class_="axis"))
-        # 首尾日期始终显示，中间只在集播出日显示
-        if day.date() == first_date.date() or day.date() == normal_end_date.date() or day.date() in ep_dates:
-            date_str = f"{day.month}.{day.day}"
-            dwg.add(dwg.text(date_str, insert=(x, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
-        day += timedelta(days=7)
+    # 横轴刻度与日期（根据 show_eps_and_title 切换绘制方式）
+    if show_eps_and_title:
+        day = first_date
+        while day <= normal_end_date:
+            x = x_pos(day)
+            dwg.add(dwg.line((x, HEIGHT - PAD_B - 4), (x, HEIGHT - PAD_B + 4), class_="axis"))
+            if day.date() == first_date.date() or day.date() == normal_end_date.date() or day.date() in ep_dates:
+                # 首个日期加上年份（如 25.1.20）
+                if day.date() == first_date.date():
+                    date_str = f"{day.year % 100}.{day.month}.{day.day}"
+                else:
+                    date_str = f"{day.month}.{day.day}"
+                dwg.add(dwg.text(date_str, insert=(x, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
+            day += timedelta(days=7)
 
-    if is_finished:
-        x_end = x_pos(latest_record)
+        if is_finished:
+            x_end = x_pos(latest_record)
+            dwg.add(dwg.line((x_end, HEIGHT - PAD_B - 4), (x_end, HEIGHT - PAD_B + 4), class_="axis"))
+            dwg.add(dwg.text("now", insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
+    else:
+        # 仅显示最早评分记录和当前时间（now）
+        x_start = x_pos(first_date)
+        dwg.add(dwg.line((x_start, HEIGHT - PAD_B - 4), (x_start, HEIGHT - PAD_B + 4), class_="axis"))
+        # 首个日期带年份
+        start_date_str = f"{first_date.year % 100}.{first_date.month}.{first_date.day}"
+        dwg.add(dwg.text(start_date_str, insert=(x_start, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
+
+        x_end = x_pos(normal_end_date)
         dwg.add(dwg.line((x_end, HEIGHT - PAD_B - 4), (x_end, HEIGHT - PAD_B + 4), class_="axis"))
         dwg.add(dwg.text("now", insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
 
-    # 剧集标题（合并后）
-    for ep in merged_eps:
-        if ep["airdate"] < first_date or ep["airdate"] > max_date:
-            continue
-        x = x_pos(ep["airdate"])
-        anchor_x = x + 16
-        anchor_y = HEIGHT - PAD_B - 12
-        dwg.add(dwg.text(
-            ep["label"],
-            insert=(anchor_x, anchor_y),
-            transform=f"rotate(-90, {anchor_x}, {anchor_y})",
-            class_="ep-label"
-        ))
+    # 剧集小标题（仅当显示剧集时绘制）
+    if show_eps_and_title:
+        for ep in merged_eps:
+            if ep["airdate"] < first_date or ep["airdate"] > max_date:
+                continue
+            x = x_pos(ep["airdate"])
+            anchor_x = x + 16
+            anchor_y = HEIGHT - PAD_B - 12
+            dwg.add(dwg.text(
+                ep["label"],
+                insert=(anchor_x, anchor_y),
+                transform=f"rotate(-90, {anchor_x}, {anchor_y})",
+                class_="ep-label"
+            ))
 
     # 平滑曲线
     raw_points = [(x_pos(s["date"]), y_pos(s["score"])) for s in cooked["scores"]]
@@ -289,15 +333,15 @@ def generate_svg(cooked: dict) -> str:
         path_d = catmull_rom_to_bezier(smoothed, tension=0.2)
         dwg.add(dwg.path(d=path_d, class_="curve"))
 
-    # 标题与评分（11. 分数位置根据评价人数长度动态左移）
+    # 动画总标题（始终显示）
     dwg.add(dwg.text(cooked["name_cn"], insert=(PAD_L, 44), class_="title"))
+
+    # 最新评分与评价人数（始终显示）
     latest_score = round(cooked["scores"][-1]["score"], 1)
     total_users = cooked["total_users"]
     user_text = f"{total_users}人评价"
-    # 估算用户文本像素宽度：数字部分半角（约9px/char），“人评价”三个全角（约18px/char）
     digit_chars = len(str(total_users))
     user_est_width = digit_chars * 9 + 3 * 18
-    # 评分数字右对齐位置：用户文本左边再留20px间距
     score_x = WIDTH - PAD_R - user_est_width - 20
     dwg.add(dwg.text(f"{latest_score:.1f}",
                      insert=(score_x, 44),
@@ -327,7 +371,18 @@ def svg_to_jpg(svg_str: str, quality: int = 90) -> bytes:
 def generate_card(anime_id: int, fmt: str = "svg") -> tuple[bytes, str]:
     raw = get_anime_data(anime_id)
     cooked = parse_and_filter(raw)
-    svg_str = generate_svg(cooked)
+
+    # 2. 检查最早评分是否晚于最后一集
+    scores_sorted = sorted(cooked["scores"], key=lambda x: x["date"])
+    eps_sorted = sorted(cooked["eps"], key=lambda e: e["airdate"])
+    show_eps_and_title = True
+    if eps_sorted and scores_sorted:
+        last_ep_date = eps_sorted[-1]["airdate"]
+        first_score_date = scores_sorted[0]["date"]
+        if first_score_date > last_ep_date:
+            show_eps_and_title = False
+
+    svg_str = generate_svg(cooked, show_eps_and_title=show_eps_and_title)
 
     if fmt == "jpg":
         try:
@@ -353,6 +408,9 @@ class AnimeCardHandler(BaseHTTPRequestHandler):
 
         try:
             content, mime = generate_card(anime_id, fmt)
+        except NotYetAired:
+            self.send_error(404, "Not yet aired")
+            return
         except Exception as e:
             self.send_error(500, str(e))
             return
