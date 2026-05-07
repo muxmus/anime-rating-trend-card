@@ -22,13 +22,13 @@ def get_anime_data(anime_id: int) -> dict:
     return resp.json()
 
 def parse_and_filter(data: dict) -> dict:
-    subject = data["subject"]
-    name_cn = subject["name_cn"] or subject["name"]
+    subject = data.get("subject", {})
+    name_cn = subject.get("name_cn") or subject.get("name") or "未知作品"
     air_date_utc = datetime.fromisoformat(subject["air_date"].replace("Z", "+00:00"))
     air_date_bjt = air_date_utc.astimezone(BJT)
 
     # 1. 检查是否未开播：获取所有 history 中最晚的 recordedAt
-    history = data["history"]
+    history = data.get("history", [])
     max_recorded_bjt = None
     for item in history:
         if "recordedAt" not in item:
@@ -54,10 +54,10 @@ def parse_and_filter(data: dict) -> dict:
 
     # 剧集信息
     eps = []
-    for item in subject["eps"]:
+    for item in subject.get("eps", []):
         if item.get("type") != 0:
             continue
-        if not item.get("airdate"):
+        if not item.get("airdate"):  # 过滤 None 和空字符串
             continue
         dt_utc = datetime.fromisoformat(item["airdate"].replace("Z", "+00:00"))
         dt_bjt = dt_utc.astimezone(BJT)
@@ -71,7 +71,10 @@ def parse_and_filter(data: dict) -> dict:
             "airdate": dt_bjt
         })
 
-    total_users = subject["rating"]["total"]
+    total_users = subject.get("rating", {}).get("total")
+    if total_users is None:
+        total_users = 0
+
     return {
         "name_cn": name_cn,
         "air_date": air_date_bjt,
@@ -146,43 +149,53 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
     normal_w = plot_w * (1 - COMPRESS_RATIO)
     compress_w = plot_w * COMPRESS_RATIO
 
+    # 检查评分数据是否存在
+    if not cooked["scores"]:
+        raise ValueError("没有可用的评分数据")
+
     # 根据是否包含剧集信息选择不同的横轴计算方式
     if not show_eps_and_title:
         # 所有评分都在最后一集之后：仅使用评分时间范围
         score_dates = [s["date"] for s in cooked["scores"]]
         first_date = min(score_dates)
         normal_end_date = max(score_dates)
-        is_finished = False   # 不加 "now" 标签，直接显示最后日期
-        # 不使用压缩区域，整个横轴线性映射
+        is_finished = False
         normal_w = plot_w
         compress_w = 0
-        eps_sorted = []       # 无剧集信息
+        eps_sorted = []
     else:
         eps_sorted = sorted(cooked["eps"], key=lambda e: e["airdate"])
-        if not eps_sorted or not cooked["scores"]:
-            raise ValueError("数据不足")
-
-        latest_record = cooked["scores"][-1]["date"]
-        last_ep_airdate = eps_sorted[-1]["airdate"]
-        is_finished = last_ep_airdate <= latest_record
-
-        if is_finished:
-            max_date = latest_record
-            normal_end_date = last_ep_airdate
+        # 如果没有有效剧集，自动切换为无剧集模式
+        if not eps_sorted:
+            show_eps_and_title = False
+            score_dates = [s["date"] for s in cooked["scores"]]
+            first_date = min(score_dates)
+            normal_end_date = max(score_dates)
+            is_finished = False
+            normal_w = plot_w
+            compress_w = 0
+            eps_sorted = []
         else:
-            next_ep = next((ep for ep in eps_sorted if ep["airdate"] > latest_record), None)
-            if next_ep is None:
-                is_finished = True
+            latest_record = cooked["scores"][-1]["date"]
+            last_ep_airdate = eps_sorted[-1]["airdate"]
+            is_finished = last_ep_airdate <= latest_record
+
+            if is_finished:
                 max_date = latest_record
                 normal_end_date = last_ep_airdate
             else:
-                max_date = next_ep["airdate"]
-                normal_end_date = next_ep["airdate"]
+                next_ep = next((ep for ep in eps_sorted if ep["airdate"] > latest_record), None)
+                if next_ep is None:
+                    is_finished = True
+                    max_date = latest_record
+                    normal_end_date = last_ep_airdate
+                else:
+                    max_date = next_ep["airdate"]
+                    normal_end_date = next_ep["airdate"]
 
-        first_date = cooked["air_date"]
-        # 正常区域宽度已算，保持不变
-        normal_w = plot_w * (1 - COMPRESS_RATIO)
-        compress_w = plot_w * COMPRESS_RATIO
+            first_date = cooked["air_date"]
+            normal_w = plot_w * (1 - COMPRESS_RATIO)
+            compress_w = plot_w * COMPRESS_RATIO
 
     span_normal = max(1, (normal_end_date - first_date).days)
 
@@ -251,7 +264,6 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
 
     # 剧集信息（仅当显示时）
     if show_eps_and_title:
-        # 合并同一天播出的集数
         merged_eps = []
         i = 0
         while i < len(eps_sorted):
@@ -279,14 +291,13 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
         merged_eps = []
         ep_dates = set()
 
-    # 横轴刻度与日期（根据 show_eps_and_title 切换绘制方式）
+    # 横轴刻度与日期
     if show_eps_and_title:
         day = first_date
         while day <= normal_end_date:
             x = x_pos(day)
             dwg.add(dwg.line((x, HEIGHT - PAD_B - 4), (x, HEIGHT - PAD_B + 4), class_="axis"))
             if day.date() == first_date.date() or day.date() == normal_end_date.date() or day.date() in ep_dates:
-                # 首个日期加上年份（如 25.1.20）
                 if day.date() == first_date.date():
                     date_str = f"{day.year % 100}.{day.month}.{day.day}"
                 else:
@@ -302,7 +313,6 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
         # 仅显示最早评分记录和当前时间（now）
         x_start = x_pos(first_date)
         dwg.add(dwg.line((x_start, HEIGHT - PAD_B - 4), (x_start, HEIGHT - PAD_B + 4), class_="axis"))
-        # 首个日期带年份
         start_date_str = f"{first_date.year % 100}.{first_date.month}.{first_date.day}"
         dwg.add(dwg.text(start_date_str, insert=(x_start, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
 
@@ -310,7 +320,7 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
         dwg.add(dwg.line((x_end, HEIGHT - PAD_B - 4), (x_end, HEIGHT - PAD_B + 4), class_="axis"))
         dwg.add(dwg.text("now", insert=(x_end, HEIGHT - PAD_B + 18), class_="date-label", text_anchor="middle"))
 
-    # 剧集小标题（仅当显示剧集时绘制）
+    # 剧集小标题（仅当显示时）
     if show_eps_and_title:
         for ep in merged_eps:
             if ep["airdate"] < first_date or ep["airdate"] > max_date:
@@ -336,7 +346,7 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
     # 动画总标题（始终显示）
     dwg.add(dwg.text(cooked["name_cn"], insert=(PAD_L, 44), class_="title"))
 
-    # 最新评分与评价人数（始终显示）
+    # 最新评分与评价人数
     latest_score = round(cooked["scores"][-1]["score"], 1)
     total_users = cooked["total_users"]
     user_text = f"{total_users}人评价"
@@ -355,12 +365,12 @@ def generate_svg(cooked: dict, show_eps_and_title: bool = True) -> str:
     return dwg.tostring()
 
 def svg_to_jpg(svg_str: str, quality: int = 90) -> bytes:
-    """将 SVG 字符串转换为 JPEG 字节流（惰性导入依赖）。"""
+    """将 SVG 字符串转换为 JPEG 字节流"""
     try:
         import cairosvg
         from PIL import Image
     except ImportError as e:
-        raise RuntimeError("请安装 cairosvg 和 Pillow：pip install cairosvg Pillow") from e
+        raise RuntimeError("请安装 cairosvg 和 Pillow") from e
 
     png_bytes = cairosvg.svg2png(bytestring=svg_str.encode('utf-8'))
     img = Image.open(io.BytesIO(png_bytes)).convert('RGB')
@@ -372,7 +382,7 @@ def generate_card(anime_id: int, fmt: str = "svg") -> tuple[bytes, str]:
     raw = get_anime_data(anime_id)
     cooked = parse_and_filter(raw)
 
-    # 2. 检查最早评分是否晚于最后一集
+    # 检查最早评分是否晚于最后一集（如果剧集存在）
     scores_sorted = sorted(cooked["scores"], key=lambda x: x["date"])
     eps_sorted = sorted(cooked["eps"], key=lambda e: e["airdate"])
     show_eps_and_title = True
