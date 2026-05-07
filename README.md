@@ -21,22 +21,20 @@
 ![](https://img.muxmus.com/ani-card/493016?type=jpg)
 
 ---
-确保依赖：
-
-`pip install requests svgwrite`
-
+确保依赖和字体：
+```
+pip install requests svgwrite
+sudo apt install fonts-noto-cjk fonts-wqy-microhei
+```
 svg转jpg需要额外安装的库：
 ```
 sudo apt install libcairo2
 pip install cairosvg Pillow
-sudo apt install fonts-dejavu-core
-sudo apt install fonts-noto-cjk
-sudo apt install fonts-wqy-microhei
 ```
 
 局限性（待改进）：
 - 主要展示放送期间的趋势，是高开低走还是稳居高位亦或有几个神回突然升高
-- 仅适用于新番，老番、OVA及剧场版会因为数据不全、（已解决）~~多集同时开播~~等原因造成各种排版问题，后续可能优化
+- （已解决）~~仅适用于新番，老番、OVA及剧场版会因为数据不全、多集同时开播等原因造成各种排版问题，后续可能优化~~
 - （已解决）~~已知如《葬送的芙莉莲》400602等由于api中包含sp、oped等造成解析错误返回500，后续会根据`subject.eps[num].type`过滤~~
 
 > *代码由deepseek生成*
